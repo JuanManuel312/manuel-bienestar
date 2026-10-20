@@ -1,4 +1,4 @@
-import {guideAvailable,openGuide} from '../lib/guide.js';
+import {guideAvailable,openGuide,diagnoseGuide} from '../lib/guide.js';
 import {Readable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 import {PublicError,settings,sign,verify,cookies,cookie,sameOrigin,validCapture,stillPaid,paypalClient,newReference} from '../lib/paypal.js';
@@ -12,7 +12,25 @@ export function makeHandler({env=process.env,fetcher=fetch}={}){return async fun
  try{
   if(!methods[action])return send(404,{error:'Ruta no encontrada.'});
   if(req.method!==methods[action]){res.setHeader('Allow',methods[action]);return send(405,{error:'Método no permitido.'});}
-  if(action==='config')return send(200,{ready:cfg.configured&&cfg.enabled&&(cfg.testAllowed||await guideAvailable(env,fetcher)),mode:cfg.mode});
+  if(action==='config'){
+   // Only fixed codes and booleans: never return credentials, URLs or upstream bodies.
+   const checks={
+    salesEnabled:cfg.enabled,
+    siteUrlValid:Boolean(cfg.origin),
+    paypalClientIdPresent:Boolean(cfg.client),
+    paypalSecretPresent:Boolean(cfg.secret),
+    accessSecretValid:Boolean(cfg.key&&cfg.key.length>=48)
+   };
+   const pdf=cfg.testAllowed?{ok:true,code:'PDF_NOT_REQUIRED_IN_SANDBOX'}:await diagnoseGuide(env,fetcher);
+   const blockers=[];
+   if(!checks.salesEnabled)blockers.push('SALES_DISABLED');
+   if(!checks.siteUrlValid)blockers.push('SITE_URL_INVALID');
+   if(!checks.paypalClientIdPresent)blockers.push('PAYPAL_CLIENT_ID_MISSING');
+   if(!checks.paypalSecretPresent)blockers.push('PAYPAL_CLIENT_SECRET_MISSING');
+   if(!checks.accessSecretValid)blockers.push('ACCESS_TOKEN_SECRET_MISSING_OR_SHORT');
+   if(!pdf.ok)blockers.push(pdf.code);
+   return send(200,{version:'diagnostic-2026-10-20',ready:cfg.configured&&cfg.enabled&&pdf.ok,mode:cfg.mode,checks,pdf,blockers,paypalCredentialsVerified:false});
+  }
   if(!cfg.configured)throw new PublicError(503,'Estamos configurando los pagos. Aún no se realizan cobros.');
   if(req.method==='POST')sameOrigin(req,cfg);
   const jar=cookies(req),api=paypalClient(cfg,fetcher);
