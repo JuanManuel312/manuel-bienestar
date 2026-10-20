@@ -1,15 +1,18 @@
+import {guideAvailable,openGuide} from '../lib/guide.js';
+import {Readable} from 'node:stream';
+import {pipeline} from 'node:stream/promises';
 import {PublicError,settings,sign,verify,cookies,cookie,sameOrigin,validCapture,stillPaid,paypalClient,newReference} from '../lib/paypal.js';
 
 export function makeHandler({env=process.env,fetcher=fetch}={}){return async function handler(req,res){
  res.setHeader('Cache-Control','private, no-store, max-age=0');res.setHeader('Vercel-CDN-Cache-Control','no-store');
  res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');
  const cfg=settings(env),url=new URL(req.url,'https://local.invalid'),action=url.searchParams.get('action');
- const methods={config:'GET',checkout:'POST',capture:'POST',access:'GET',restore:'POST'};
+ const methods={config:'GET',checkout:'POST',capture:'POST',access:'GET',restore:'POST',download:'GET'};
  const send=(status,data)=>res.status(status).json(data);
  try{
   if(!methods[action])return send(404,{error:'Ruta no encontrada.'});
   if(req.method!==methods[action]){res.setHeader('Allow',methods[action]);return send(405,{error:'Método no permitido.'});}
-  if(action==='config')return send(200,{ready:cfg.configured&&cfg.enabled&&cfg.testAllowed,mode:cfg.mode,accessTest:true});
+  if(action==='config')return send(200,{ready:cfg.configured&&cfg.enabled&&(cfg.testAllowed||await guideAvailable(env,fetcher)),mode:cfg.mode});
   if(!cfg.configured)throw new PublicError(503,'Estamos configurando los pagos. Aún no se realizan cobros.');
   if(req.method==='POST')sameOrigin(req,cfg);
   const jar=cookies(req),api=paypalClient(cfg,fetcher);
@@ -21,14 +24,14 @@ export function makeHandler({env=process.env,fetcher=fetch}={}){return async fun
    return capture;
   }
   if(action==='checkout'){
-   if(!cfg.enabled||!cfg.testAllowed)throw new PublicError(503,'Las compras aún no están habilitadas.');
-   if(body.acceptTest!==true)throw new PublicError(400,'Confirma que se trata de una compra de prueba de acceso.');
+   if(!cfg.enabled||(!cfg.testAllowed&&!await guideAvailable(env,fetcher)))throw new PublicError(503,'Las compras aún no están habilitadas.');
+   if(body.acceptPurchase!==true)throw new PublicError(400,'Confirma la compra de la guía.');
    const existing=verify(jar['__Host-access'],cfg,'access');
    if(existing){await checkAccess(existing);return send(200,{url:'/mi-guia'});}
    const pending=verify(jar['__Host-checkout'],cfg,'checkout');
    if(pending)return send(200,{url:'/pago?token='+encodeURIComponent(pending.order)});
    const reference=newReference();
-   const order=await api('/v2/checkout/orders','POST',{intent:'CAPTURE',purchase_units:[{custom_id:reference,description:'Prueba de acceso privado — Manuel Santos (no incluye la guía)',amount:{currency_code:'USD',value:'9.90'}}],payment_source:{paypal:{experience_context:{brand_name:'Manuel Santos',shipping_preference:'NO_SHIPPING',user_action:'PAY_NOW',return_url:cfg.origin+'/pago',cancel_url:cfg.origin+'/pago?cancelado=1'}}}},reference);
+   const order=await api('/v2/checkout/orders','POST',{intent:'CAPTURE',purchase_units:[{custom_id:reference,description:'Adiós al Metabolismo Lento: Adelgaza sin Dietas',amount:{currency_code:'USD',value:'9.90'}}],payment_source:{paypal:{experience_context:{brand_name:'Manuel Santos',shipping_preference:'NO_SHIPPING',user_action:'PAY_NOW',return_url:cfg.origin+'/pago',cancel_url:cfg.origin+'/pago?cancelado=1'}}}},reference);
    const link=order.links?.find(v=>v.rel==='payer-action'||v.rel==='approve')?.href;
    let approval;try{approval=new URL(link);}catch{throw new PublicError(502,'PayPal no devolvió un enlace de pago válido.');}
    if(approval.protocol!=='https:'||approval.hostname!==(cfg.mode==='live'?'www.paypal.com':'www.sandbox.paypal.com')||!/^[A-Z0-9]+$/.test(order.id))throw new PublicError(502,'No se pudo iniciar el pago.');
@@ -55,12 +58,19 @@ export function makeHandler({env=process.env,fetcher=fetch}={}){return async fun
    res.setHeader('Set-Cookie',cookie('__Host-access',sign({kind:'access',order:ticket.order,capture:ticket.capture},cfg,86400*365),86400*365));
    return send(200,{ok:true});
   }
+  if(action==='download'){
+   const ticket=verify(jar['__Host-access'],cfg,'access');await checkAccess(ticket);
+   const file=await openGuide(env,fetcher);
+   res.setHeader('Content-Type','application/pdf');
+   res.setHeader('Content-Disposition','attachment; filename="Adios-al-Metabolismo-Lento.pdf"');
+   res.status(200);await pipeline(Readable.fromWeb(file.body),res);return;
+  }
   if(action==='access'){
    const ticket=verify(jar['__Host-access'],cfg,'access');await checkAccess(ticket);
    const recovery=sign({kind:'recovery',order:ticket.order,capture:ticket.capture},cfg,86400*365*10);
    // Protected content is generated only after server-side payment verification.
-   return send(200,{title:'Tu acceso está confirmado.',content:'Esta es tu página privada de prueba. El servidor ha verificado tu pago directamente con PayPal. La guía final todavía no se ha publicado; esta prueba no incluye un PDF.',order:ticket.order,mode:cfg.mode,recovery:cfg.origin+'/mi-guia#access='+recovery});
+   return send(200,{title:'Tu acceso está confirmado.',content:'Tu pago ha sido verificado. Aquí tienes tu espacio para volver a la guía cuando lo necesites.',downloadReady:await guideAvailable(env,fetcher),order:ticket.order,mode:cfg.mode,recovery:cfg.origin+'/mi-guia#access='+recovery});
   }
- }catch(error){return send(error instanceof PublicError?error.status:503,{error:error instanceof PublicError?error.message:'No pudimos completar la comprobación. Inténtalo otra vez en unos minutos.'});}
+ }catch(error){if(res.headersSent){res.destroy();return;}return send(error instanceof PublicError?error.status:503,{error:error instanceof PublicError?error.message:'No pudimos completar la comprobación. Inténtalo otra vez en unos minutos.'});}
 };}
 export default makeHandler();
